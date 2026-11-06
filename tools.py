@@ -1,21 +1,23 @@
 """Tool handlers for the Tightbeam plugin.
 
 Rules: every handler takes (args: dict, **kwargs), never raises, and always
-returns a JSON string. Heavy deps (google-api-python-client) are imported
-lazily inside handlers so the plugin loads without them.
+returns a JSON string. Engines are imported lazily so the plugin loads fast.
+Zero pip dependencies: YouTube runs on host-owned OAuth REST calls, OpusClip
+runs through the user's Hermes-managed MCP connection via ctx.dispatch_tool.
 """
 
 import json
 import os
 from pathlib import Path
 
-# Set by register() in __init__.py — gives handlers access to ctx.llm etc.
+# Set by register() in __init__.py — gives handlers access to ctx.llm / dispatch_tool.
 _CTX = None
 
 
 def bind_ctx(ctx):
     global _CTX
-    _CTX = ctx
+    ctx_ref = ctx
+    _CTX = ctx_ref
 
 
 def _data_dir() -> Path:
@@ -35,12 +37,11 @@ def _err(msg: str, **extra) -> str:
     return json.dumps({"error": msg, **extra})
 
 
-def _not_implemented(tool: str) -> str:
-    return _err(
-        "not_implemented",
-        tool=tool,
-        hint="Tightbeam scaffold v0.1.0 — this tool lands in a later build. See README.",
-    )
+def _safe(fn, *a, **kw) -> str:
+    try:
+        return json.dumps(fn(*a, **kw), default=str)
+    except Exception as e:  # noqa: BLE001 — handlers never raise
+        return _err(str(e)[:500], type=type(e).__name__)
 
 
 # ---------------------------------------------------------------- status
@@ -48,10 +49,6 @@ def _not_implemented(tool: str) -> str:
 
 def tightbeam_status(args: dict, **kwargs) -> str:
     d = _data_dir()
-    yt_token = d / "youtube_token.json"
-    yt_client = d / "client_secret.json"
-    hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-    opus_tokens = (hermes_home / "mcp-tokens" / "opusclip.json").exists()
     state: dict = {}
     sf = d / "state.json"
     if sf.exists():
@@ -61,6 +58,7 @@ def tightbeam_status(args: dict, **kwargs) -> str:
                 state = loaded
         except Exception:
             state = {"error": "state.json corrupt"}
+
     def _dict(key):
         v = state.get(key)
         return v if isinstance(v, dict) else {}
@@ -69,21 +67,54 @@ def tightbeam_status(args: dict, **kwargs) -> str:
     channel = _dict("channel")
     sweep_st = _dict("sweep")
     watch_st = _dict("watch")
+
+    # live probes (cheap, read-only): YouTube grant + OpusClip MCP
+    yt_probe = "unknown"
+    try:
+        from hermes_cli.auth_constants import AuthError  # noqa: F401
+        from hermes_cli.plugin_provider_requests import ProviderNotSignedIn, credentialed_provider_request
+
+        try:
+            resp = credentialed_provider_request(
+                "google", "GET",
+                "https://www.googleapis.com/youtube/v3/channels?part=id&mine=true",
+                timeout=15,
+            )
+            yt_probe = "signed_in" if resp.status < 300 else f"http_{resp.status}"
+        except ProviderNotSignedIn:
+            yt_probe = "not_signed_in"
+        except Exception:
+            yt_probe = "unavailable"
+    except Exception:
+        yt_probe = "unavailable"
+
+    opus_probe = "unknown"
+    if _CTX is not None and hasattr(_CTX, "dispatch_tool"):
+        try:
+            out = _CTX.dispatch_tool("mcp__opusclip__opusclip_get_usage", {})
+            opus_probe = "connected" if out else "connected"
+        except Exception as e:
+            opus_probe = "not_connected" if any(
+                k in str(e).lower() for k in ("not found", "unknown tool", "not connected", "connection_required")
+            ) else f"error: {str(e)[:80]}"
+    else:
+        opus_probe = "no_plugin_context"
+
     return json.dumps(
         {
             "plugin": "tightbeam",
-            "version": "0.3.0",
+            "version": "0.4.0",
             "data_dir": str(d),
             "youtube": {
-                "client_secret": yt_client.exists(),
-                "token": yt_token.exists(),
-                "ready": yt_token.exists(),
+                "sign_in": yt_probe,
                 "channel": channel.get("title"),
-                "hint": None if yt_token.exists() else "run yt_auth_url (see tightbeam skill for GCP setup)",
+                "hint": None if yt_probe == "signed_in" else
+                "set TIGHTBEAM_GOOGLE_CLIENT_ID/SECRET in .env, then: hermes auth add tightbeam:google",
             },
             "opusclip": {
-                "token_found": opus_tokens,
-                "hint": None if opus_tokens else "run: hermes mcp login opusclip",
+                "mcp": opus_probe,
+                "hint": None if opus_probe == "connected" else
+                "hermes mcp add opusclip --url https://mcp.opus.pro/mcp --auth oauth && hermes mcp login opusclip",
             },
             "sweep": {
                 "audited_videos": len(audit.get("videos", [])),
@@ -104,23 +135,6 @@ def _youtube_mod():
     except ImportError:
         import youtube  # dev/test context
     return youtube
-
-
-def _safe(fn, *a, **kw) -> str:
-    try:
-        return json.dumps(fn(*a, **kw), default=str)
-    except Exception as e:  # noqa: BLE001 — handlers never raise
-        return _err(str(e)[:400], type=type(e).__name__)
-
-
-def yt_auth_url(args: dict, **kwargs) -> str:
-    y = _youtube_mod()
-    return _safe(y.auth_url, args.get("client_secret_file", ""))
-
-
-def yt_auth_code(args: dict, **kwargs) -> str:
-    y = _youtube_mod()
-    return _safe(y.auth_code, args.get("code", ""))
 
 
 def yt_audit(args: dict, **kwargs) -> str:
@@ -170,51 +184,57 @@ def _opus_mod():
     return opusclip
 
 
-def tightbeam_credits(args: dict, **kwargs) -> str:
+def _bridge():
     o = _opus_mod()
-    return _safe(o.credits)
+    return o, o.OpusBridge(_CTX)
+
+
+def tightbeam_credits(args: dict, **kwargs) -> str:
+    o, b = _bridge()
+    return _safe(o.credits, b)
 
 
 def publish_upload(args: dict, **kwargs) -> str:
-    o = _opus_mod()
-    return _safe(o.upload, args.get("path", ""))
+    o, b = _bridge()
+    return _safe(o.upload, b, args.get("path", ""))
 
 
 def publish_submit(args: dict, **kwargs) -> str:
-    o = _opus_mod()
-    return _safe(o.submit, args.get("upload_id", ""), args.get("title", "short"))
+    o, b = _bridge()
+    return _safe(o.submit, b, args.get("upload_id", ""), args.get("title", "short"))
 
 
 def publish_schedule(args: dict, **kwargs) -> str:
-    o = _opus_mod()
+    o, b = _bridge()
     llm = getattr(_CTX, "llm", None) if _CTX is not None else None
+    copy = args.get("copy") if isinstance(args.get("copy"), dict) else None
+    title = (copy or {}).get("youtube", {}).get("title", "") if copy else ""
     return _safe(
         o.schedule,
+        b,
         args.get("project_id", ""),
         args.get("clip_id", ""),
         args.get("publish_at", ""),
         args.get("platforms"),
-        args.get("copy"),
-        (args.get("copy") or {}).get("youtube", {}).get("title", "") if isinstance(args.get("copy"), dict) else "",
+        copy,
+        title,
         llm,
     )
 
 
 def publish_status(args: dict, **kwargs) -> str:
-    o = _opus_mod()
-    return _safe(o.status, args.get("project_id", ""), args.get("start_at", ""), args.get("end_at", ""))
+    o, b = _bridge()
+    return _safe(o.status, b, args.get("project_id", ""), args.get("start_at", ""), args.get("end_at", ""))
 
 
 def publish_unschedule(args: dict, **kwargs) -> str:
-    o = _opus_mod()
-    return _safe(o.unschedule, args.get("schedule_id", ""))
+    o, b = _bridge()
+    return _safe(o.unschedule, b, args.get("schedule_id", ""))
 
 
 HANDLERS = {
     "tightbeam_status": tightbeam_status,
     "tightbeam_credits": tightbeam_credits,
-    "yt_auth_url": yt_auth_url,
-    "yt_auth_code": yt_auth_code,
     "yt_audit": yt_audit,
     "yt_watch": yt_watch,
     "yt_optimize": yt_optimize,

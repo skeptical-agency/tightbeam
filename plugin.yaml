@@ -1,13 +1,13 @@
 name: tightbeam
-version: 0.1.0
+version: 0.4.0
 description: "Tightbeam: beam shorts to every platform via OpusClip and keep your whole YouTube catalog optimized. High-g, no drama."
 author: Skeptical Agency
 homepage: https://github.com/skeptical-agency/tightbeam
+license: MIT
+tags: [youtube, publishing, opusclip, metadata, automation, creator]
 provides_tools:
   - tightbeam_status
   - tightbeam_credits
-  - yt_auth_url
-  - yt_auth_code
   - yt_audit
   - yt_watch
   - yt_optimize
@@ -17,6 +17,23 @@ provides_tools:
   - publish_schedule
   - publish_status
   - publish_unschedule
+optional_env:
+  - name: TIGHTBEAM_GOOGLE_CLIENT_ID
+    description: "Google Cloud Desktop OAuth client ID (YouTube Data API v3 enabled). Only needed for the YouTube optimizer pillar."
+    url: "https://console.cloud.google.com/apis/credentials"
+  - name: TIGHTBEAM_GOOGLE_CLIENT_SECRET
+    description: "Client secret paired with TIGHTBEAM_GOOGLE_CLIENT_ID."
+    secret: true
+oauth:
+  - id: google
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    token_url: https://oauth2.googleapis.com/token
+    scopes:
+      - https://www.googleapis.com/auth/youtube.force-ssl
+    client_id_env: TIGHTBEAM_GOOGLE_CLIENT_ID
+    client_secret_env: TIGHTBEAM_GOOGLE_CLIENT_SECRET
+    hosts: [www.googleapis.com]
+    authorize_params: {access_type: offline, prompt: consent}
 config_schema:
   tag_channel:
     type: str
@@ -39,7 +56,3 @@ config_schema:
     default: 60
     label: "Daily videos.update cap"
     description: "Each update costs 50 quota units of the 10,000/day YouTube quota. 60 = 3,000 units."
-python_dependencies:
-  - google-api-python-client>=2.0,<3
-  - google-auth-oauthlib>=1.0,<2
-  - google-auth-httplib2>=0.2,<1

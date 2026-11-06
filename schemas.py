@@ -3,9 +3,9 @@
 STATUS = {
     "name": "tightbeam_status",
     "description": (
-        "Tightbeam health check: YouTube OAuth state, OpusClip auth state, "
-        "sweep/audit progress, and pending-publish queue. Run this first when "
-        "something looks wrong."
+        "Tightbeam health check: setup state for both pillars (YouTube sign-in "
+        "via `hermes auth add tightbeam:google`, OpusClip via MCP), sweep/audit "
+        "progress, and the watch watermark. Run this first when something looks wrong."
     ),
     "parameters": {
         "type": "object",
@@ -20,42 +20,6 @@ CREDITS = {
         "(they gate separately). Returns which pool would block a submit."
     ),
     "parameters": {"type": "object", "properties": {}},
-}
-
-YT_AUTH_URL = {
-    "name": "yt_auth_url",
-    "description": (
-        "Start YouTube OAuth (PKCE). Returns a URL for the user to open and "
-        "approve; the dead localhost landing page afterwards is expected. "
-        "The user pastes the full redirect URL back, then call yt_auth_code."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "client_secret_file": {
-                "type": "string",
-                "description": "Path to a Google OAuth desktop client_secret JSON. Optional after first setup.",
-            },
-        },
-    },
-}
-
-YT_AUTH_CODE = {
-    "name": "yt_auth_code",
-    "description": (
-        "Exchange the OAuth redirect URL (or bare code) from yt_auth_url for a "
-        "stored refresh token. Codes are one-shot; on failure re-run yt_auth_url."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "code": {
-                "type": "string",
-                "description": "Full redirect URL from the browser address bar, or the bare code.",
-            },
-        },
-        "required": ["code"],
-    },
 }
 
 YT_AUDIT = {
@@ -242,8 +206,6 @@ PUBLISH_UNSCHEDULE = {
 ALL = {
     "tightbeam_status": STATUS,
     "tightbeam_credits": CREDITS,
-    "yt_auth_url": YT_AUTH_URL,
-    "yt_auth_code": YT_AUTH_CODE,
     "yt_audit": YT_AUDIT,
     "yt_watch": YT_WATCH,
     "yt_optimize": YT_OPTIMIZE,

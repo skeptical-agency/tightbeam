@@ -1,9 +1,9 @@
-"""Tightbeam YouTube engine — Data API v3 operations.
+"""Tightbeam YouTube engine — Data API v3 over Hermes-owned OAuth.
 
-Ported and generalized from production pipelines (300K-sub channel):
-PKCE OAuth, catalog audit, new-upload watch, single-video optimize, and a
-budgeted resumable sweep. All functions return plain dicts; handlers in
-tools.py serialize them.
+RULE 11 COMPLIANT: this module never sees a token. The OAuth grant is declared
+under `oauth:` in plugin.yaml, signed in with `hermes auth add tightbeam:google`,
+stored and refreshed by Hermes, and attached by credentialed_provider_request().
+All calls are plain REST to www.googleapis.com (a declared host).
 
 State lives in <data_dir>/state.json:
   {"channel": {...}, "audit": {"ts", "videos": [...]},
@@ -16,10 +16,10 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
-SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
-SCOPES = [SCOPE]
-REDIRECT_URI = "http://localhost"
+API = "https://www.googleapis.com/youtube/v3"
+PROVIDER = "google"  # the oauth: entry id in plugin.yaml
 
 STOP = set(
     """a an the and or of to in on for with is are was were be been this that these those
@@ -52,8 +52,18 @@ TITLE_SCHEMA = {
     "required": ["current_score", "candidates"],
 }
 
+AUTH_HINT = (
+    "Not signed in. Setup: set TIGHTBEAM_GOOGLE_CLIENT_ID / TIGHTBEAM_GOOGLE_CLIENT_SECRET "
+    "in .env (your own Google Cloud Desktop OAuth client, YouTube Data API v3 enabled, app "
+    "published to Production), then run: hermes auth add tightbeam:google"
+)
+
 
 class QuotaError(RuntimeError):
+    pass
+
+
+class NotSignedIn(RuntimeError):
     pass
 
 
@@ -81,80 +91,59 @@ def _cfg(key, default, ctx=None):
     return default
 
 
-def _client_secret_path() -> Path:
-    return _data_dir() / "client_secret.json"
-
-
-def _token_path() -> Path:
-    return _data_dir() / "youtube_token.json"
-
-
-def _state_path() -> Path:
-    return _data_dir() / "state.json"
-
-
 def load_state() -> dict:
-    p = _state_path()
+    p = _data_dir() / "state.json"
     if p.exists():
         try:
-            return json.loads(p.read_text())
+            loaded = json.loads(p.read_text())
+            if isinstance(loaded, dict):
+                return loaded
         except Exception:
             pass
     return {"channel": {}, "audit": {}, "sweep": {"done": [], "log": []}, "watch": {}}
 
 
 def save_state(st: dict) -> None:
-    p = _state_path()
+    p = _data_dir() / "state.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(st, indent=1))
     tmp.replace(p)
 
 
-def _creds():
-    from google.oauth2.credentials import Credentials
+def _api(method: str, path: str, params: dict | None = None, body: dict | None = None, retries: int = 4) -> dict:
+    """One YouTube Data API call through Hermes-owned credentials (rule 11)."""
+    from hermes_cli.plugin_provider_requests import (  # documented public helper
+        ProviderNotSignedIn,
+        credentialed_provider_request,
+    )
 
-    tp = _token_path()
-    if not tp.exists():
-        raise RuntimeError(
-            f"NOT_AUTHENTICATED: no token at {tp}. Run yt_auth_url, approve in a browser, "
-            "then yt_auth_code with the redirect URL."
-        )
-    creds = Credentials.from_authorized_user_file(str(tp), [SCOPE])
-    if creds.expired and creds.refresh_token:
-        from google.auth.transport.requests import Request
-
-        creds.refresh(Request())
-        tp.write_text(creds.to_json())
-    return creds
-
-
-def _yt():
-    from googleapiclient.discovery import build
-
-    return build("youtube", "v3", credentials=_creds(), cache_discovery=False)
-
-
-def _update_video(yt, video_id: str, body: dict, part: str, retries: int = 4):
-    """videos.update with 412 backoff (transient) and quota detection (fatal)."""
+    url = f"{API}/{path}"
+    if params:
+        url += "?" + urlencode({k: v for k, v in params.items() if v not in (None, "")})
     last = None
     for attempt in range(retries):
         try:
-            return yt.videos().update(part=part, body=body).execute()
-        except Exception as e:  # noqa: BLE001
-            msg = str(e)
-            if "quotaExceeded" in msg or "daily quota" in msg.lower():
-                raise QuotaError(msg)
-            last = e
-            status = getattr(e, "resp", {}).get("status", "")
-            if status == "412" or "Precondition" in msg:
-                time.sleep(8 * (attempt + 1))  # 8/16/24s backoff
-                continue
-            if status in ("400", "500", "503"):
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise
-    raise RuntimeError(f"update failed after {retries} attempts: {last}")
+            resp = credentialed_provider_request(PROVIDER, method, url, json=body, timeout=60)
+        except ProviderNotSignedIn as exc:
+            raise NotSignedIn(f"{AUTH_HINT} ({exc})")
+        if resp.status < 300:
+            try:
+                data = resp.json()
+            except Exception:
+                return {"raw": (resp.text or "")[:500]}
+            return data if isinstance(data, dict) else {"raw": data}
+        text = (resp.text or "")[:400]
+        if "quotaExceeded" in text or "dailyLimitExceeded" in text:
+            raise QuotaError(text)
+        if resp.status == 401:
+            raise NotSignedIn(f"401 from YouTube API — try: hermes auth refresh tightbeam:google. {text[:150]}")
+        last = f"HTTP {resp.status}: {text}"
+        if resp.status in (412, 400, 500, 503):
+            time.sleep(8 * (attempt + 1))  # 412 precondition is transient: 8/16/24s backoff
+            continue
+        raise RuntimeError(last)
+    raise RuntimeError(f"failed after {retries} attempts: {last}")
 
 
 def _parse_duration(iso: str) -> int:
@@ -167,9 +156,7 @@ def _parse_duration(iso: str) -> int:
 
 def derive_tags(title: str, desc: str, kind: str, channel_tag: str = "") -> list:
     """Rule-based tags from title + description. No external spend."""
-    text = f"{title} {desc[:400]}".lower()
-    tags = []
-    tags.append(re.sub(r"#\w+", "", title).lower().strip())
+    tags = [re.sub(r"#\w+", "", title).lower().strip()]
     cleaned = re.sub(r"[^a-z0-9 ]", " ", title.lower()).strip()
     words = [w for w in cleaned.split() if w not in STOP and len(w) > 2]
     for n in (3, 2):
@@ -177,7 +164,6 @@ def derive_tags(title: str, desc: str, kind: str, channel_tag: str = "") -> list
             gram = " ".join(words[i : i + n])
             if gram not in tags:
                 tags.append(gram)
-    # salient single words from the description opening
     dw = [w for w in re.sub(r"[^a-z0-9 ]", " ", desc[:300].lower()).split() if w not in STOP and len(w) > 3]
     for w in dict.fromkeys(dw):
         if w not in tags:
@@ -188,13 +174,12 @@ def derive_tags(title: str, desc: str, kind: str, channel_tag: str = "") -> list
         tags.append("shorts")
     if channel_tag:
         tags.append(channel_tag.lower())
-    # dedupe + enforce YouTube's 500-char TOTAL limit
     seen, out, total = set(), [], 0
     for t in tags:
         t = t.strip()
         if not t or t in seen or len(t) > 60:
             continue
-        if total + len(t) > 480:
+        if total + len(t) > 480:  # YouTube 500-char TOTAL tag limit
             continue
         seen.add(t)
         out.append(t)
@@ -202,81 +187,12 @@ def derive_tags(title: str, desc: str, kind: str, channel_tag: str = "") -> list
     return out
 
 
-# ---------------------------------------------------------------- auth
-
-
-def auth_url(client_secret_file: str = "") -> dict:
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    csp = _client_secret_path()
-    if client_secret_file:
-        src = Path(client_secret_file).expanduser()
-        if not src.exists():
-            return {"error": f"client_secret_file not found: {src}"}
-        csp.parent.mkdir(parents=True, exist_ok=True)
-        csp.write_text(src.read_text())
-    if not csp.exists():
-        return {
-            "error": "NO_CLIENT_SECRET",
-            "expected_path": str(csp),
-            "hint": "Google Cloud Console: enable YouTube Data API v3, create a Desktop OAuth client, "
-            "publish the app to Production, download the JSON, then call yt_auth_url with "
-            "client_secret_file=/path/to/client_secret.json",
-        }
-    client_config = json.loads(csp.read_text())
-    flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
-    url, _ = flow.authorization_url(prompt="consent", access_type="offline", include_granted_scopes="true")
-    pending = {"client_config": client_config, "code_verifier": getattr(flow, "code_verifier", None)}
-    (_data_dir() / "oauth_pending.json").write_text(json.dumps(pending))
-    return {
-        "auth_url": url,
-        "instructions": "Open this URL (incognito if multiple Google accounts), approve. The dead "
-        "localhost landing page afterwards is EXPECTED — paste the full address-bar URL "
-        "into yt_auth_code.",
-    }
-
-
-def auth_code(raw: str) -> dict:
-    from urllib.parse import parse_qs, urlparse
-
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    raw = (raw or "").strip()
-    code = (parse_qs(urlparse(raw).query).get("code") or [""])[0] if raw.startswith("http") else raw
-    if not code:
-        return {"error": "no code found in input"}
-    pending_path = _data_dir() / "oauth_pending.json"
-    saved_verifier = None
-    if pending_path.exists():
-        pending = json.loads(pending_path.read_text())
-        client_config = pending["client_config"]
-        saved_verifier = pending.get("code_verifier")
-    else:
-        csp = _client_secret_path()
-        if not csp.exists():
-            return {"error": "no pending flow and no client_secret.json; run yt_auth_url first"}
-        client_config = json.loads(csp.read_text())
-    flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
-    if saved_verifier:
-        flow.code_verifier = saved_verifier  # attribute name matters; wrong name fails silently
-    os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
-    try:
-        flow.fetch_token(code=code)
-    except Exception as e:
-        return {"error": f"token exchange failed (codes are one-shot; re-run yt_auth_url): {e}"}
-    creds = flow.credentials
-    payload = json.loads(creds.to_json())
-    payload["scopes"] = list(creds.scopes or [SCOPE])
-    _token_path().write_text(json.dumps(payload))
-    if pending_path.exists():
-        pending_path.unlink()
-    me = check()
-    return {"status": "AUTHENTICATED", "token_path": str(_token_path()), "channel": me}
+# ---------------------------------------------------------------- auth status
 
 
 def check() -> dict:
-    yt = _yt()
-    items = yt.channels().list(part="snippet", mine=True).execute().get("items", [])
+    data = _api("GET", "channels", {"part": "snippet", "mine": "true"})
+    items = data.get("items", [])
     if not items:
         return {"error": "NO_CHANNEL"}
     ch = items[0]
@@ -286,20 +202,20 @@ def check() -> dict:
 # ---------------------------------------------------------------- audit / watch
 
 
-def _uploads_playlist(yt) -> tuple:
-    items = yt.channels().list(part="snippet,contentDetails", mine=True).execute().get("items", [])
+def _uploads_playlist() -> tuple:
+    data = _api("GET", "channels", {"part": "snippet,contentDetails", "mine": "true"})
+    items = data.get("items", [])
     if not items:
-        raise RuntimeError("NO_CHANNEL on this token")
+        raise RuntimeError("NO_CHANNEL on this grant")
     ch = items[0]
     return ch["id"], ch["snippet"]["title"], ch["contentDetails"]["relatedPlaylists"]["uploads"]
 
 
-def _fetch_videos(yt, ids: list) -> list:
+def _fetch_videos(ids: list) -> list:
     out = []
     for i in range(0, len(ids), 50):
-        batch = ids[i : i + 50]
-        resp = yt.videos().list(part="snippet,statistics,contentDetails", id=",".join(batch)).execute()
-        out.extend(resp.get("items", []))
+        data = _api("GET", "videos", {"part": "snippet,statistics,contentDetails", "id": ",".join(ids[i : i + 50])})
+        out.extend(data.get("items", []))
     return out
 
 
@@ -321,24 +237,21 @@ def _row(v: dict) -> dict:
 
 def audit(max_videos: int = 0) -> dict:
     st = load_state()
-    yt = _yt()
-    ch_id, ch_title, uploads = _uploads_playlist(yt)
-    videos, ids, token = [], [], None
+    ch_id, ch_title, uploads = _uploads_playlist()
+    ids, token = [], None
     while True:
-        resp = yt.playlistItems().list(
-            part="contentDetails", playlistId=uploads, maxResults=50, pageToken=token or ""
-        ).execute()
-        for it in resp.get("items", []):
+        data = _api("GET", "playlistItems", {"part": "contentDetails", "playlistId": uploads, "maxResults": 50, "pageToken": token})
+        for it in data.get("items", []):
             vid = it.get("contentDetails", {}).get("videoId")
             if vid:
                 ids.append(vid)
         if max_videos and len(ids) >= max_videos:
             ids = ids[:max_videos]
             break
-        token = resp.get("nextPageToken")
+        token = data.get("nextPageToken")
         if not token:
             break
-    rows = [_row(v) for v in _fetch_videos(yt, ids)]
+    rows = [_row(v) for v in _fetch_videos(ids)]
     summary = {
         "total": len(rows),
         "shorts": sum(1 for r in rows if r["kind"] == "short"),
@@ -355,8 +268,7 @@ def audit(max_videos: int = 0) -> dict:
 
 def watch(lookback_hours: int = 0) -> dict:
     st = load_state()
-    yt = _yt()
-    _, _, uploads = _uploads_playlist(yt)
+    _, _, uploads = _uploads_playlist()
     now = datetime.now(timezone.utc)
     wm_iso = st.get("watch", {}).get("watermark")
     if lookback_hours:
@@ -365,30 +277,24 @@ def watch(lookback_hours: int = 0) -> dict:
         cutoff = datetime.fromisoformat(wm_iso)
     else:
         cutoff = now - timedelta(hours=48)
-    new, token, seen_pages = [], None, 0
-    while seen_pages < 4:  # uploads playlist is newest-first; 200 is plenty
-        resp = yt.playlistItems().list(
-            part="contentDetails", playlistId=uploads, maxResults=50, pageToken=token or ""
-        ).execute()
-        seen_pages += 1
+    new, token, pages = [], None, 0
+    while pages < 4:  # uploads playlist is newest-first; 200 videos is plenty
+        data = _api("GET", "playlistItems", {"part": "contentDetails", "playlistId": uploads, "maxResults": 50, "pageToken": token})
+        pages += 1
         stop = False
-        for it in resp.get("items", []):
+        for it in data.get("items", []):
             pub = it.get("contentDetails", {}).get("videoPublishedAt", "")
             vid = it.get("contentDetails", {}).get("videoId")
             if not pub or not vid:
                 continue
-            pubdt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-            if pubdt <= cutoff:
+            if datetime.fromisoformat(pub.replace("Z", "+00:00")) <= cutoff:
                 stop = True
                 break
-            new.append({"id": vid, "published": pub})
-        token = resp.get("nextPageToken")
+            new.append(vid)
+        token = data.get("nextPageToken")
         if stop or not token:
             break
-    fresh = []
-    if new:
-        rows = [_row(v) for v in _fetch_videos(yt, [n["id"] for n in new])]
-        fresh = rows
+    fresh = [_row(v) for v in _fetch_videos(new)] if new else []
     if fresh:
         st.setdefault("watch", {})["watermark"] = max(r["published"] for r in fresh)
     elif not wm_iso:
@@ -400,7 +306,7 @@ def watch(lookback_hours: int = 0) -> dict:
 # ---------------------------------------------------------------- optimize
 
 
-def _llm_title(llm, video_row: dict, desc: str, kind: str):
+def _llm_title(llm, title: str, desc: str, kind: str):
     """Ask the host LLM for scored title candidates. Returns dict or None."""
     if llm is None:
         return None
@@ -412,7 +318,7 @@ def _llm_title(llm, video_row: dict, desc: str, kind: str):
                 "no ALL-CAPS spam, honest to the content, main keyword early) and score each 0-100 "
                 "on click-through potential + search clarity. Also score the CURRENT title the same way."
             ),
-            input=[{"type": "text", "text": json.dumps({"current_title": video_row["title"], "description": desc[:1200]})}],
+            input=[{"type": "text", "text": json.dumps({"current_title": title, "description": desc[:1200]})}],
             json_schema=TITLE_SCHEMA,
             purpose="tightbeam.title-gen",
             temperature=0.5,
@@ -437,8 +343,8 @@ def optimize(video_id: str, fields=None, dry_run: bool = False, llm=None, ctx=No
     channel_tag = _cfg("tag_channel", "", ctx)
     default_category = str(_cfg("default_category", "", ctx) or "")
     title_source = _cfg("title_source", "llm", ctx)
-    yt = _yt()
-    items = yt.videos().list(part="snippet,status", id=video_id).execute().get("items", [])
+    data = _api("GET", "videos", {"part": "snippet,status", "id": video_id})
+    items = data.get("items", [])
     if not items:
         return {"error": "video not found", "video_id": video_id}
     v = items[0]
@@ -450,13 +356,13 @@ def optimize(video_id: str, fields=None, dry_run: bool = False, llm=None, ctx=No
     if "tags" in fields and not snippet.get("tags"):
         changes["tags"] = derive_tags(snippet.get("title", ""), snippet.get("description", ""), kind, channel_tag)
     if "title" in fields and title_source == "llm":
-        t = _llm_title(llm, {"title": snippet.get("title", "")}, snippet.get("description", ""), kind)
+        t = _llm_title(llm, snippet.get("title", ""), snippet.get("description", ""), kind)
         if t and not t.get("kept"):
             changes["title"] = t["new_title"]
             changes["_title_meta"] = t
         elif t:
             changes["_title_meta"] = t
-    if "defaults" in fields and default_category and snippet.get("categoryId") in ("", None):
+    if "defaults" in fields and default_category and not snippet.get("categoryId"):
         changes["categoryId"] = default_category
 
     write_keys = {k for k in changes if not k.startswith("_")}
@@ -466,44 +372,45 @@ def optimize(video_id: str, fields=None, dry_run: bool = False, llm=None, ctx=No
         return {"video_id": video_id, "status": "dry_run", "planned": {k: changes[k] for k in write_keys}}
 
     new_snippet = dict(snippet)
-    if "tags" in changes:
-        new_snippet["tags"] = changes["tags"]
-    if "title" in changes:
-        new_snippet["title"] = changes["title"]
-    if "categoryId" in changes:
-        new_snippet["categoryId"] = changes["categoryId"]
+    for k in ("tags", "title", "categoryId"):
+        if k in changes:
+            new_snippet[k] = changes[k]
     body = {
         "id": video_id,
         "snippet": new_snippet,
         "status": {k: status[k] for k in ("privacyStatus", "embeddable", "license", "publicStatsViewable", "madeForKids") if k in status},
     }
     try:
-        _update_video(yt, video_id, body, "snippet,status")
+        _api("PUT", "videos", {"part": "snippet,status"}, body)
     except QuotaError as e:
         return {"error": "QUOTA_EXCEEDED", "detail": str(e)[:200], "video_id": video_id}
-    except Exception as e:
+    except RuntimeError as e:
         msg = str(e)
         if "TEST_AND_COMPARE" in msg and "title" in changes:
-            new_snippet["title"] = snippet.get("title")  # A/B test locks titles; fall back to tags-only
+            new_snippet["title"] = snippet.get("title")  # A/B test locks titles; tags-only fallback
             body["snippet"] = new_snippet
             changes.pop("title", None)
             try:
-                _update_video(yt, video_id, body, "snippet,status")
+                _api("PUT", "videos", {"part": "snippet,status"}, body)
             except Exception as e2:
                 return {"error": str(e2)[:300], "video_id": video_id}
             changes["title_blocked"] = "test-and-compare active"
         else:
             return {"error": msg[:300], "video_id": video_id}
     time.sleep(2)
-    back = yt.videos().list(part="snippet", id=video_id).execute()["items"][0]["snippet"]
+    back = _api("GET", "videos", {"part": "snippet", "id": video_id})["items"][0]["snippet"]
     verified = {"title": back.get("title"), "n_tags": len(back.get("tags", []))}
-    st["sweep"]["log"].append(
-        {"id": video_id, "action": ",".join(sorted(write_keys)), "ts": time.strftime("%Y-%m-%d %H:%M")}
-    )
+    st = load_state()
+    st["sweep"]["log"].append({"id": video_id, "action": ",".join(sorted(write_keys)), "ts": time.strftime("%Y-%m-%d %H:%M")})
     if video_id not in st["sweep"]["done"]:
         st["sweep"]["done"].append(video_id)
     save_state(st)
-    return {"video_id": video_id, "status": "updated", "changes": {k: (v if k != "tags" else f"{len(v)} tags") for k, v in changes.items()}, "verified": verified}
+    return {
+        "video_id": video_id,
+        "status": "updated",
+        "changes": {k: (f"{len(val)} tags" if k == "tags" else val) for k, val in changes.items()},
+        "verified": verified,
+    }
 
 
 # ---------------------------------------------------------------- sweep
@@ -524,18 +431,20 @@ def sweep(budget_updates: int = 10, mode: str = "both", dry_run: bool = False, l
     done = set(st["sweep"]["done"])
     if mode in ("tags", "both"):
         targets = [r for r in audit_rows if r["id"] not in done and not r["has_tags"]]
-        targets.sort(key=lambda r: r["views"], reverse=True)
     else:
         targets = [r for r in audit_rows if r["id"] not in done]
-        targets.sort(key=lambda r: r["views"], reverse=True)
+    targets.sort(key=lambda r: r["views"], reverse=True)
     targets = targets[:budget]
     results = {"ok": 0, "no_changes": 0, "fail": 0, "quota_stop": False, "updates": [], "used_today": used_today, "budget": budget}
     if dry_run:
         return {"status": "dry_run", "would_process": [{"id": t["id"], "title": t["title"][:60], "views": t["views"]} for t in targets]}
     for t in targets:
-        fields = ["tags", "defaults"] if mode in ("tags", "both") else ["tags", "title", "defaults"]
         if mode == "titles":
             fields = ["title", "defaults"]
+        elif mode == "tags":
+            fields = ["tags", "defaults"]
+        else:
+            fields = ["tags", "title", "defaults"]
         try:
             r = optimize(t["id"], fields=fields, dry_run=False, llm=llm, ctx=ctx)
         except QuotaError:
@@ -560,5 +469,7 @@ def sweep(budget_updates: int = 10, mode: str = "both", dry_run: bool = False, l
         time.sleep(3)  # write-consistency spacing
     st = load_state()
     results["total_done"] = len(st["sweep"]["done"])
-    results["backlog_no_tags"] = sum(1 for r in st.get("audit", {}).get("videos", []) if not r["has_tags"] and r["id"] not in set(st["sweep"]["done"]))
+    results["backlog_no_tags"] = sum(
+        1 for r in st.get("audit", {}).get("videos", []) if not r["has_tags"] and r["id"] not in set(st["sweep"]["done"])
+    )
     return results
