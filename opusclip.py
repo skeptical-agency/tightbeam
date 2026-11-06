@@ -71,6 +71,26 @@ def _parse(out) -> dict | list:
         return {"text": s[:4000]}
 
 
+def _unwrap(payload, depth: int = 0):
+    """Dispatch/MCP layers wrap payloads as JSON strings under result/text/content
+    keys; unwrap to the real object so _get/_find_items work on native types."""
+    if depth > 3:
+        return payload
+    if isinstance(payload, str):
+        s = payload.strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                return _unwrap(json.loads(s), depth + 1)
+            except Exception:
+                return payload
+        return payload
+    if isinstance(payload, dict) and len(payload) == 1:
+        k = next(iter(payload))
+        if k in ("result", "text", "content", "output") and isinstance(payload[k], (str, dict, list)):
+            return _unwrap(payload[k], depth + 1)
+    return payload
+
+
 class OpusBridge:
     """Calls the user's Hermes-managed OpusClip MCP tools via dispatch_tool."""
 
@@ -91,37 +111,43 @@ class OpusBridge:
             if any(k in low for k in ("not found", "unknown tool", "no such tool", "not connected", "connection_required")):
                 raise OpusError(f"{SETUP_HINT} ({msg[:150]})")
             raise OpusError(f"{tool}: {msg[:300]}")
-        payload = _parse(out)
-        if isinstance(payload, dict):
-            text = str(payload.get("text", ""))
-            low = text.lower()
-            if any(k in low for k in ("not found", "unknown tool", "connection_required", "not connected")):
-                raise OpusError(f"{SETUP_HINT} ({text[:150]})")
-            if "insufficient credits" in low or "not enough credits" in low:
-                raise OpusError(f"CREDITS_REJECTED: {text[:300]}")
-        return payload
+        raw = _parse(out)
+        # error sniffing BEFORE unwrapping (error text can live in wrapper keys)
+        blob = json.dumps(raw)[:2000].lower() if isinstance(raw, (dict, list)) else str(raw).lower()
+        if any(k in blob for k in ("connection_required", "not connected", "no such tool", "unknown tool")):
+            raise OpusError(f"{SETUP_HINT} ({blob[:150]})")
+        if "insufficient credits" in blob or "not enough credits" in blob:
+            raise OpusError(f"CREDITS_REJECTED: {blob[:300]}")
+        return _unwrap(raw)
 
 
 # ---------------------------------------------------------------- helpers
 
 
-def _find_items(payload):
-    """OpusClip responses nest lists inconsistently; find the first list of dicts."""
+def _find_items(payload, depth: int = 0):
+    """OpusClip responses nest lists inconsistently (and dispatch wraps them
+    as JSON strings); unwrap recursively and find the first list of dicts."""
+    if depth > 4:
+        return None
+    if isinstance(payload, str):
+        s = payload.strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                return _find_items(json.loads(s), depth + 1)
+            except Exception:
+                return None
+        return None
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        text = payload.get("text")
-        if isinstance(text, str):
-            try:
-                return _find_items(json.loads(text))
-            except Exception:
-                pass
-        for key in ("accounts", "items", "posts", "clips", "projects", "schedules", "data", "result"):
-            v = payload.get(key)
+        for key in ("accounts", "items", "posts", "clips", "projects", "schedules", "data", "result", "text", "content", "output"):
+            if key not in payload:
+                continue
+            v = payload[key]
             if isinstance(v, list):
                 return v
-            if isinstance(v, dict):
-                found = _find_items(v)
+            if isinstance(v, (dict, str)):
+                found = _find_items(v, depth + 1)
                 if found is not None:
                     return found
         for v in payload.values():
