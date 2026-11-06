@@ -51,41 +51,48 @@ def tightbeam_status(args: dict, **kwargs) -> str:
     yt_token = d / "youtube_token.json"
     yt_client = d / "client_secret.json"
     hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-    opus_candidates = list(hermes_home.glob("**/opusclip*token*")) + list(
-        (hermes_home / "mcp-auth").glob("*opusclip*")
-    ) if (hermes_home / "mcp-auth").exists() else []
-    state = {}
+    opus_tokens = (hermes_home / "mcp-tokens" / "opusclip.json").exists()
+    state: dict = {}
     sf = d / "state.json"
     if sf.exists():
         try:
-            state = json.loads(sf.read_text())
+            loaded = json.loads(sf.read_text())
+            if isinstance(loaded, dict):
+                state = loaded
         except Exception:
             state = {"error": "state.json corrupt"}
+    def _dict(key):
+        v = state.get(key)
+        return v if isinstance(v, dict) else {}
+
+    audit = _dict("audit")
+    channel = _dict("channel")
+    sweep_st = _dict("sweep")
+    watch_st = _dict("watch")
     return json.dumps(
         {
             "plugin": "tightbeam",
-            "version": "0.1.0",
+            "version": "0.3.0",
             "data_dir": str(d),
             "youtube": {
                 "client_secret": yt_client.exists(),
                 "token": yt_token.exists(),
                 "ready": yt_token.exists(),
+                "channel": channel.get("title"),
+                "hint": None if yt_token.exists() else "run yt_auth_url (see tightbeam skill for GCP setup)",
             },
             "opusclip": {
-                "token_found": bool(opus_candidates),
-                "hint": "run: hermes mcp login opusclip" if not opus_candidates else None,
+                "token_found": opus_tokens,
+                "hint": None if opus_tokens else "run: hermes mcp login opusclip",
             },
             "sweep": {
-                "audited_videos": state.get("audited_videos", 0),
-                "swept_videos": state.get("swept_videos", 0),
-                "pending_publish": len(state.get("pending_publish", [])),
+                "audited_videos": len(audit.get("videos", [])),
+                "audited_at": audit.get("ts"),
+                "swept_videos": len(sweep_st.get("done", [])),
             },
+            "watch": {"watermark": watch_st.get("watermark")},
         }
     )
-
-
-def tightbeam_credits(args: dict, **kwargs) -> str:
-    return _not_implemented("tightbeam_credits")
 
 
 # ---------------------------------------------------------------- youtube
@@ -155,24 +162,52 @@ def yt_sweep(args: dict, **kwargs) -> str:
 # ---------------------------------------------------------------- publish
 
 
+def _opus_mod():
+    try:
+        from . import opusclip  # plugin package context
+    except ImportError:
+        import opusclip  # dev/test context
+    return opusclip
+
+
+def tightbeam_credits(args: dict, **kwargs) -> str:
+    o = _opus_mod()
+    return _safe(o.credits)
+
+
 def publish_upload(args: dict, **kwargs) -> str:
-    return _not_implemented("publish_upload")
+    o = _opus_mod()
+    return _safe(o.upload, args.get("path", ""))
 
 
 def publish_submit(args: dict, **kwargs) -> str:
-    return _not_implemented("publish_submit")
+    o = _opus_mod()
+    return _safe(o.submit, args.get("upload_id", ""), args.get("title", "short"))
 
 
 def publish_schedule(args: dict, **kwargs) -> str:
-    return _not_implemented("publish_schedule")
+    o = _opus_mod()
+    llm = getattr(_CTX, "llm", None) if _CTX is not None else None
+    return _safe(
+        o.schedule,
+        args.get("project_id", ""),
+        args.get("clip_id", ""),
+        args.get("publish_at", ""),
+        args.get("platforms"),
+        args.get("copy"),
+        (args.get("copy") or {}).get("youtube", {}).get("title", "") if isinstance(args.get("copy"), dict) else "",
+        llm,
+    )
 
 
 def publish_status(args: dict, **kwargs) -> str:
-    return _not_implemented("publish_status")
+    o = _opus_mod()
+    return _safe(o.status, args.get("project_id", ""), args.get("start_at", ""), args.get("end_at", ""))
 
 
 def publish_unschedule(args: dict, **kwargs) -> str:
-    return _not_implemented("publish_unschedule")
+    o = _opus_mod()
+    return _safe(o.unschedule, args.get("schedule_id", ""))
 
 
 HANDLERS = {
