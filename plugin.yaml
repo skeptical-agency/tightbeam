@@ -17,6 +17,28 @@ provides_tools:
   - publish_schedule
   - publish_status
   - publish_unschedule
+config_schema:
+  tag_channel:
+    type: str
+    default: ""
+    label: "Always-on tag"
+    description: "Added to every generated tag set, e.g. your channel name."
+  default_category:
+    type: str
+    default: ""
+    label: "Default category id"
+    description: "Applied only to videos with no category. 20=Gaming, 22=People&Blogs, 27=Education, 28=Science&Tech. Empty = never touch."
+  title_source:
+    type: str
+    choices: [llm, keep]
+    default: llm
+    label: "Title generation"
+    description: "llm = host model drafts and scores candidates (titles mode only); keep = never touch titles."
+  daily_update_cap:
+    type: int
+    default: 60
+    label: "Daily videos.update cap"
+    description: "Each update costs 50 quota units of the 10,000/day YouTube quota. 60 = 3,000 units."
 python_dependencies:
   - google-api-python-client>=2.0,<3
   - google-auth-oauthlib>=1.0,<2

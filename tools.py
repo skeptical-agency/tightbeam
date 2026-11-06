@@ -91,28 +91,65 @@ def tightbeam_credits(args: dict, **kwargs) -> str:
 # ---------------------------------------------------------------- youtube
 
 
+def _youtube_mod():
+    try:
+        from . import youtube  # plugin package context
+    except ImportError:
+        import youtube  # dev/test context
+    return youtube
+
+
+def _safe(fn, *a, **kw) -> str:
+    try:
+        return json.dumps(fn(*a, **kw), default=str)
+    except Exception as e:  # noqa: BLE001 — handlers never raise
+        return _err(str(e)[:400], type=type(e).__name__)
+
+
 def yt_auth_url(args: dict, **kwargs) -> str:
-    return _not_implemented("yt_auth_url")
+    y = _youtube_mod()
+    return _safe(y.auth_url, args.get("client_secret_file", ""))
 
 
 def yt_auth_code(args: dict, **kwargs) -> str:
-    return _not_implemented("yt_auth_code")
+    y = _youtube_mod()
+    return _safe(y.auth_code, args.get("code", ""))
 
 
 def yt_audit(args: dict, **kwargs) -> str:
-    return _not_implemented("yt_audit")
+    y = _youtube_mod()
+    return _safe(y.audit, int(args.get("max_videos") or 0))
 
 
 def yt_watch(args: dict, **kwargs) -> str:
-    return _not_implemented("yt_watch")
+    y = _youtube_mod()
+    return _safe(y.watch, int(args.get("lookback_hours") or 0))
 
 
 def yt_optimize(args: dict, **kwargs) -> str:
-    return _not_implemented("yt_optimize")
+    y = _youtube_mod()
+    llm = getattr(_CTX, "llm", None) if _CTX is not None else None
+    return _safe(
+        y.optimize,
+        args.get("video_id", ""),
+        args.get("fields"),
+        bool(args.get("dry_run")),
+        llm,
+        _CTX,
+    )
 
 
 def yt_sweep(args: dict, **kwargs) -> str:
-    return _not_implemented("yt_sweep")
+    y = _youtube_mod()
+    llm = getattr(_CTX, "llm", None) if _CTX is not None else None
+    return _safe(
+        y.sweep,
+        int(args.get("budget_updates") or 10),
+        args.get("mode") or "both",
+        bool(args.get("dry_run")),
+        llm,
+        _CTX,
+    )
 
 
 # ---------------------------------------------------------------- publish
