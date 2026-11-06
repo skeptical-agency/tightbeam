@@ -1,0 +1,155 @@
+"""Tool handlers for the Tightbeam plugin.
+
+Rules: every handler takes (args: dict, **kwargs), never raises, and always
+returns a JSON string. Heavy deps (google-api-python-client) are imported
+lazily inside handlers so the plugin loads without them.
+"""
+
+import json
+import os
+from pathlib import Path
+
+# Set by register() in __init__.py — gives handlers access to ctx.llm etc.
+_CTX = None
+
+
+def bind_ctx(ctx):
+    global _CTX
+    _CTX = ctx
+
+
+def _data_dir() -> Path:
+    """Plugin state dir that survives updates and follows the active profile."""
+    try:
+        from plugins.plugin_storage import plugin_data_dir  # documented public API
+
+        return Path(plugin_data_dir("tightbeam"))
+    except Exception:
+        home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        p = Path(home) / "plugin-data" / "tightbeam"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+
+def _err(msg: str, **extra) -> str:
+    return json.dumps({"error": msg, **extra})
+
+
+def _not_implemented(tool: str) -> str:
+    return _err(
+        "not_implemented",
+        tool=tool,
+        hint="Tightbeam scaffold v0.1.0 — this tool lands in a later build. See README.",
+    )
+
+
+# ---------------------------------------------------------------- status
+
+
+def tightbeam_status(args: dict, **kwargs) -> str:
+    d = _data_dir()
+    yt_token = d / "youtube_token.json"
+    yt_client = d / "client_secret.json"
+    hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    opus_candidates = list(hermes_home.glob("**/opusclip*token*")) + list(
+        (hermes_home / "mcp-auth").glob("*opusclip*")
+    ) if (hermes_home / "mcp-auth").exists() else []
+    state = {}
+    sf = d / "state.json"
+    if sf.exists():
+        try:
+            state = json.loads(sf.read_text())
+        except Exception:
+            state = {"error": "state.json corrupt"}
+    return json.dumps(
+        {
+            "plugin": "tightbeam",
+            "version": "0.1.0",
+            "data_dir": str(d),
+            "youtube": {
+                "client_secret": yt_client.exists(),
+                "token": yt_token.exists(),
+                "ready": yt_token.exists(),
+            },
+            "opusclip": {
+                "token_found": bool(opus_candidates),
+                "hint": "run: hermes mcp login opusclip" if not opus_candidates else None,
+            },
+            "sweep": {
+                "audited_videos": state.get("audited_videos", 0),
+                "swept_videos": state.get("swept_videos", 0),
+                "pending_publish": len(state.get("pending_publish", [])),
+            },
+        }
+    )
+
+
+def tightbeam_credits(args: dict, **kwargs) -> str:
+    return _not_implemented("tightbeam_credits")
+
+
+# ---------------------------------------------------------------- youtube
+
+
+def yt_auth_url(args: dict, **kwargs) -> str:
+    return _not_implemented("yt_auth_url")
+
+
+def yt_auth_code(args: dict, **kwargs) -> str:
+    return _not_implemented("yt_auth_code")
+
+
+def yt_audit(args: dict, **kwargs) -> str:
+    return _not_implemented("yt_audit")
+
+
+def yt_watch(args: dict, **kwargs) -> str:
+    return _not_implemented("yt_watch")
+
+
+def yt_optimize(args: dict, **kwargs) -> str:
+    return _not_implemented("yt_optimize")
+
+
+def yt_sweep(args: dict, **kwargs) -> str:
+    return _not_implemented("yt_sweep")
+
+
+# ---------------------------------------------------------------- publish
+
+
+def publish_upload(args: dict, **kwargs) -> str:
+    return _not_implemented("publish_upload")
+
+
+def publish_submit(args: dict, **kwargs) -> str:
+    return _not_implemented("publish_submit")
+
+
+def publish_schedule(args: dict, **kwargs) -> str:
+    return _not_implemented("publish_schedule")
+
+
+def publish_status(args: dict, **kwargs) -> str:
+    return _not_implemented("publish_status")
+
+
+def publish_unschedule(args: dict, **kwargs) -> str:
+    return _not_implemented("publish_unschedule")
+
+
+HANDLERS = {
+    "tightbeam_status": tightbeam_status,
+    "tightbeam_credits": tightbeam_credits,
+    "yt_auth_url": yt_auth_url,
+    "yt_auth_code": yt_auth_code,
+    "yt_audit": yt_audit,
+    "yt_watch": yt_watch,
+    "yt_optimize": yt_optimize,
+    "yt_sweep": yt_sweep,
+    "publish_upload": publish_upload,
+    "publish_submit": publish_submit,
+    "publish_schedule": publish_schedule,
+    "publish_status": publish_status,
+    "publish_unschedule": publish_unschedule,
+}

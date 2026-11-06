@@ -1,0 +1,23 @@
+name: tightbeam
+version: 0.1.0
+description: "Tightbeam: beam shorts to every platform via OpusClip and keep your whole YouTube catalog optimized. High-g, no drama."
+author: Skeptical Agency
+homepage: https://github.com/skeptical-agency/tightbeam
+provides_tools:
+  - tightbeam_status
+  - tightbeam_credits
+  - yt_auth_url
+  - yt_auth_code
+  - yt_audit
+  - yt_watch
+  - yt_optimize
+  - yt_sweep
+  - publish_upload
+  - publish_submit
+  - publish_schedule
+  - publish_status
+  - publish_unschedule
+python_dependencies:
+  - google-api-python-client>=2.0,<3
+  - google-auth-oauthlib>=1.0,<2
+  - google-auth-httplib2>=0.2,<1
