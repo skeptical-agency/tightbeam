@@ -202,12 +202,90 @@ def list_accounts(b: OpusBridge) -> dict:
     return {"connected": sorted(found.keys()), "accounts": [i for i in items if isinstance(i, dict)]}
 
 
+# ---------------------------------------------------------------- upload safety
+# Review fixes (teknium1, PR NousResearch/hermes-agent#149920):
+# 1) publish_upload must never read arbitrary paths — resolve first, refuse
+#    anything Hermes' read blocklist denies, accept only regular video files.
+# 2) upload_url + resumable Location must be https on known OpusClip/GCS hosts;
+#    redirects are validated hop-by-hop instead of blindly followed.
+
+VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
+ALLOWED_UPLOAD_HOSTS = {"storage.googleapis.com", "opus.pro"}
+ALLOWED_HOST_SUFFIXES = (".opus.pro",)
+
+
+def _validate_video_path(path: str) -> Path:
+    """Resolve `path` and enforce the read blocklist + video allowlist.
+
+    Raises OpusError on anything unsafe. Symlinks are resolved BEFORE the
+    checks, so a link named video.mp4 -> ~/.ssh/id_rsa is refused twice over
+    (blocklist + extension).
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        raise OpusError("upload path is required")
+    try:
+        from agent.file_safety import get_read_block_error
+    except Exception:
+        # Fail closed: without Hermes' blocklist we cannot prove a path is safe.
+        raise OpusError(
+            "REFUSED_UPLOAD_PATH: agent.file_safety unavailable in this runtime; "
+            "uploads are disabled without the Hermes read blocklist"
+        )
+    # NT-namespace/device-path tricks are caught on the raw string; everything
+    # else on the fully resolved absolute path (resolve first, then blocklist).
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except Exception as e:
+        raise OpusError(f"REFUSED_UPLOAD_PATH: unresolvable path ({e})")
+    blocked = get_read_block_error(raw) or get_read_block_error(str(resolved))
+    if blocked:
+        raise OpusError(f"REFUSED_UPLOAD_PATH: {blocked}")
+    if not resolved.is_file():
+        raise OpusError(f"REFUSED_UPLOAD_PATH: not a regular file: {resolved}")
+    if resolved.suffix.lower() not in VIDEO_EXTS:
+        raise OpusError(
+            f"REFUSED_UPLOAD_PATH: only video files are allowed "
+            f"({'/'.join(sorted(VIDEO_EXTS))}), got: {resolved.name}"
+        )
+    return resolved
+
+
+def _validate_upload_url(url, context: str = "upload_url") -> str:
+    """Require https + an expected OpusClip/GCS host. Raises OpusError otherwise."""
+    from urllib.parse import urlparse
+
+    u = urlparse(str(url or ""))
+    if u.scheme != "https":
+        raise OpusError(f"REFUSED_{context.upper()}: scheme must be https, got {u.scheme!r}")
+    host = (u.hostname or "").lower()
+    if not (host in ALLOWED_UPLOAD_HOSTS or any(host.endswith(s) for s in ALLOWED_HOST_SUFFIXES)):
+        raise OpusError(
+            f"REFUSED_{context.upper()}: host {host!r} not allowed "
+            f"(expected storage.googleapis.com or *.opus.pro)"
+        )
+    return str(url)
+
+
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    """Validate every redirect hop against the same https/host allowlist."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_upload_url(newurl, "redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _upload_opener():
+    return urllib.request.build_opener(_GuardedRedirect)
+
+
 def upload(b: OpusBridge, path: str) -> dict:
-    p = Path(path).expanduser()
-    if not p.exists():
-        return {"error": f"file not found: {p}"}
+    try:
+        p = _validate_video_path(path)
+    except OpusError as e:
+        return {"error": str(e)[:400]}
     size_mb = max(1, round(p.stat().st_size / (1024 * 1024)))
-    ext = p.suffix.lstrip(".").lower() or "mp4"
+    ext = p.suffix.lstrip(".").lower()
     link = b.call("opusclip_create_upload_link", {"extension": ext, "sizeMb": size_mb})
     if not isinstance(link, dict):
         return {"error": "unexpected create_upload_link response", "raw": str(link)[:300]}
@@ -215,22 +293,37 @@ def upload(b: OpusBridge, path: str) -> dict:
     upload_id = _get(link, "upload_id", "uploadId")
     if not upload_url or not upload_id:
         return {"error": "no upload_url/upload_id in response", "raw": str(link)[:400]}
+    try:
+        _validate_upload_url(upload_url, "upload_url")
+    except OpusError as e:
+        return {"error": str(e)[:400]}
+    opener = _upload_opener()
     # resumable: POST start -> Location -> PUT binary. Never one-shot PUT (400s).
     # The signed URL carries its own auth; no credentials are attached by us.
     req = urllib.request.Request(
         upload_url, data=b"", method="POST",
         headers={"x-goog-resumable": "start", "Content-Length": "0"},
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        session_url = r.headers.get("Location")
+    try:
+        with opener.open(req, timeout=60) as r:
+            session_url = r.headers.get("Location")
+    except OpusError as e:
+        return {"error": str(e)[:400]}
     if not session_url:
         return {"error": "no Location header from resumable start"}
+    try:
+        _validate_upload_url(session_url, "session_url")
+    except OpusError as e:
+        return {"error": str(e)[:400]}
     with open(p, "rb") as f:
         put = urllib.request.Request(
             session_url, data=f.read(), method="PUT", headers={"Content-Type": "video/mp4"}
         )
-        with urllib.request.urlopen(put, timeout=1200) as r:
-            status = r.status
+        try:
+            with opener.open(put, timeout=1200) as r:
+                status = r.status
+        except OpusError as e:
+            return {"error": str(e)[:400]}
     if status not in (200, 201):
         return {"error": f"PUT returned {status}"}
     return {
